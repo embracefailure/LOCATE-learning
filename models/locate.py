@@ -115,22 +115,34 @@ class Net(nn.Module):
         exo_proj = self._reshape_transform(exo_proj, self.patch, self.stride)
 
         b, c, h, w = ego_desc.shape #[B, 384, 14, 14]
-        ego_cls_attn = ego_attn[:, :, 0, 1:].reshape(b, 6, h, w)
-        ego_cls_attn = (ego_cls_attn > ego_cls_attn.flatten(-2, -1).mean(-1, keepdim=True).unsqueeze(-1)).float()
-        head_idxs = [0, 1, 3]
-        ego_sam = ego_cls_attn[:, head_idxs].mean(1)
-        ego_sam = normalize_minmax(ego_sam)
-        ego_sam_flat = ego_sam.flatten(-2, -1)
+        ego_cls_attn = ego_attn[:, :, 0, 1:].reshape(b, 6, h, w) #ego_attn的维度为[B, 6, 197, 197]，取出第一个token的注意力权重，然后reshape到[B, 6, 14, 14]
+        ego_cls_attn = (ego_cls_attn > ego_cls_attn.flatten(-2, -1).mean(-1, keepdim=True).unsqueeze(-1)).float()#取出注意力权重大于平均值的部分
+        #[B, 6, 14, 14] -> [B, 6, 196] ->[B,6,1]->[B,6,1,1]
+        # 假设我们有一个均值tensor: [B, 6, 1, 1]
+        # 值为[[[[0.5]]]] (每个头的平均注意力值)
+
+        # 原始注意力图: [B, 6, 14, 14]
+        # 值为从0到1的注意力权重
+
+        # 广播后的比较操作会将0.5与每个位置的值比较
+        # 大于0.5的位置变为1，小于0.
+        
+        head_idxs = [0, 1, 3] #从原始注意力头中选择第0、1、3号头
+        ego_sam = ego_cls_attn[:, head_idxs].mean(1) #取出对应的头，然后求平均值，尺寸从[B, 6, 14, 14] -> [B, 3, 14, 14] -> [B, 14, 14]
+        ego_sam = normalize_minmax(ego_sam) #将注意力值归一化到[0,1]区间
+        ego_sam_flat = ego_sam.flatten(-2, -1) #将注意力值扁平化，用于后续相似度计算 sam应该是salienc map的简称
 
         # --- Affordance CAM generation --- #
-        exo_proj = self.aff_exo_proj(exo_proj)
-        aff_cam = self.aff_fc(exo_proj)  # b*num_exo x 36 x h x w
-        aff_logits = self.gap(aff_cam).reshape(b, num_exo, self.aff_classes)
-        aff_cam_re = aff_cam.reshape(b, num_exo, self.aff_classes, h, w)
+        exo_proj = self.aff_exo_proj(exo_proj) #  [B, 384, 14, 14]经过卷积后尺寸不变
+        aff_cam = self.aff_fc(exo_proj)  # b*num_exo x 36 x h x w，有num张exo_proj，存疑这个处理之后aff_cam的尺寸
+        aff_logits = self.gap(aff_cam).reshape(b, num_exo, self.aff_classes)#送入GAP，计算分类分数
+        aff_cam_re = aff_cam.reshape(b, num_exo, self.aff_classes, h, w) # b , num_exo , 36 , h , w
 
+        #生成psuedo ground truth CAM
         gt_aff_cam = torch.zeros(b, num_exo, h, w).cuda()
+        #aff_label[b_]：获取第b_个样本的真实标签，[aff_cam_re[b_, :, aff_label[b_]]]：选择该样本所有外部视角下，对应正确标签的CAM，将选择的CAM赋值给gt_aff_cam的第b_个样本
         for b_ in range(b):
-            gt_aff_cam[b_, :] = aff_cam_re[b_, :, aff_label[b_]]
+            gt_aff_cam[b_, :] = aff_cam_re[b_, :, aff_label[b_]] 
 
         # --- Clustering extracted descriptors based on CAM --- #
         ego_desc_flat = ego_desc.flatten(-2, -1)  # b x 384 x hw
