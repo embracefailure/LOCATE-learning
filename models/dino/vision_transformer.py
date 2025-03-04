@@ -255,21 +255,21 @@ class VisionTransformer(nn.Module):
         return output
 
     def get_last_key(self, x, extra_layer=None):
-        x = self.prepare_tokens(x)
-        key_mid = 0
-        for i, blk in enumerate(self.blocks):
-            if extra_layer != None and i == extra_layer:
+        x = self.prepare_tokens(x) #将输入图像转换为token序列
+        key_mid = 0 #初始化中间层key值 
+        for i, blk in enumerate(self.blocks): #遍历Transfomrer块
+            if extra_layer != None and i == extra_layer: #如果指定了额外层，就保存指定层的key
                 x, key, attn = blk(x, return_key=True)
                 key_mid = key
-            elif i < len(self.blocks) - 1:
+            elif i < len(self.blocks) - 1: #如果不是最后一层，就继续向下传递
                 x = blk(x)
             else:
                 # return attention of the last block
-                x, key, attn = blk(x, return_key=True)
+                x, key, attn = blk(x, return_key=True) #x是特征图
                 if extra_layer == None:
-                    return x, key, attn
+                    return x, key, attn #如果没有指定额外层，就返回最后一层的key
                 else:
-                    return key_mid, x, key, attn
+                    return key_mid, x, key, attn #如果指定了额外层，就返回指定层的key和最后一层的key
 
 
 def vit_tiny(patch_size=16, **kwargs):

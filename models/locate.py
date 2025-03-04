@@ -3,15 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from models.dino import vision_transformer as vits
 from models.dino.utils import load_pretrained_weights
-from models.model_util import *
+from models.model_util import *  #导入该模块中的所有公开内容
 from fast_pytorch_kmeans import KMeans
 
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super(Mlp, self).__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
+        out_features = out_features or in_features #如果out_features为None，则将out_features设置为in_features
+        hidden_features = hidden_features or in_features #如果hidden_features为None，则将hidden_features设置为in_features
         self.norm = nn.LayerNorm(in_features)
         self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
@@ -22,35 +22,38 @@ class Mlp(nn.Module):
         x = self.norm(x)
         x = self.fc1(x)
         x = self.act(x)
-        x = self.drop(x)
+        x = self.drop(x)#dropout
         x = self.fc2(x)
         x = self.drop(x)
         return x
 
 
 class Net(nn.Module):
-
+    #定义一个Net类，继承自nn.Module类
     def __init__(self, aff_classes=36):
-        super(Net, self).__init__()
+        super(Net, self).__init__() #调用父类的构造函数
 
-        self.aff_classes = aff_classes
-        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.aff_classes = aff_classes #定义aff_classes属性
+        self.gap = nn.AdaptiveAvgPool2d(1) #定义一个全局平均池化层
 
         # --- hyper-parameters --- #
-        self.aff_cam_thd = 0.6
-        self.part_iou_thd = 0.6
-        self.cel_margin = 0.5
+        self.aff_cam_thd = 0.6 #CAM激活阈值，值越高，选取的区域越关键
+        self.part_iou_thd = 0.6 #部分IOU阈值，值越高，选取的区域越关键
+        self.cel_margin = 0.5 #对比学习的边界值，控制特征embeddings之间的相似度
 
         # --- dino-vit features --- #
-        self.vit_feat_dim = 384
-        self.cluster_num = 3
-        self.stride = 16
-        self.patch = 16
+        self.vit_feat_dim = 384  # dino-vit feature dimension
+        self.cluster_num = 3 #聚类数目，本文分为object, background, human三类
+        self.stride = 16  # dino-vit stride
+        self.patch = 16 # dino-vit patch size 对图像的切分处理需要两个参数，一个是patch size，一个是stride
 
-        self.vit_model = vits.__dict__['vit_small'](patch_size=self.patch, num_classes=0)
-        load_pretrained_weights(self.vit_model, '', None, 'vit_small', self.patch)
+        self.vit_model = vits.__dict__['vit_small'](patch_size=self.patch, num_classes=0) #加载预训练的vit模型，具体操作：._dict_能够访问模块的命名空间子弟啊，获取名为vits的模型类或者函数，然后完成实例化
+        load_pretrained_weights(self.vit_model, '', None, 'vit_small', self.patch) #加载预训练权重
 
         # --- learning parameters --- #
+        #对应原文里面定位关注的特征部分。
+        #先投影，输入特征维度为dino vit的输出维度，输出维度=输入维度，隐藏层维度=输入维度的4倍，激活函数为GELU，dropout=0
+        #self.aff_fc是一个卷积层，输入维度为dino vit的输出维度（也是前两个卷积的输出维度），输出维度为aff_classes，对应原文1x1class aware convolution ，为了生成每个标签类别的CAM
         self.aff_proj = Mlp(in_features=self.vit_feat_dim, hidden_features=int(self.vit_feat_dim * 4),
                             act_layer=nn.GELU, drop=0.)
         self.aff_ego_proj = nn.Sequential(
@@ -73,19 +76,40 @@ class Net(nn.Module):
 
     def forward(self, exo, ego, aff_label, epoch):
 
-        num_exo = exo.shape[1]
+        num_exo = exo.shape[1] # number of exocentric images in each sample
         exo = exo.flatten(0, 1)  # b*num_exo x 3 x 224 x 224
 
         # --- Extract deep descriptors from DINO-vit --- #
+        # 以ego_desc为例：
+        # ego_key维度: [batch_size, channels, patches+1, patches+1]
+        # 例如: [B, 384, 197, 197]，其中197 = 14*14 + 1(CLS token)
+        
+        # 1. permute(0, 2, 3, 1): [B, 384, 197, 197] -> [B, 197, 197, 384]
+        # 2. flatten(-2, -1): [B, 197, 197, 384] -> [B, 197, 197*384]
+        # 3. detach(): 分离计算图
+        
+        # 1. ego_desc[:, 1:]: 移除CLS token，[B, 197, 197*384] -> [B, 196, 197*384]
+        # 2. self.aff_proj(): MLP投影
+        # 3. 残差连接: 原始特征 + 投影特征
+        
+        #1. ego_desc[:, 1:, :]: 移除CLS token，[B, 197, 197*384] -> [B, 196, 197*384]
+        # 2. _reshape_transform内部转换:
+        #    - 计算height和width: (224-16)/16 + 1 = 14
+        #    - reshape: [B, 196, C] -> [B, 14, 14, C]
+        #    - transpose: [B, 14, 14, C] -> [B, C, 14, 14]
+        
         with torch.no_grad():
             _, ego_key, ego_attn = self.vit_model.get_last_key(ego)  # attn: b x 6 x (1+hw) x (1+hw)
             _, exo_key, exo_attn = self.vit_model.get_last_key(exo)
-            ego_desc = ego_key.permute(0, 2, 3, 1).flatten(-2, -1).detach()
+            # permute: 调整维度顺序
+            # flatten: 将最后两个维度合并
+            # detach: 分离计算图，节省内存
+            ego_desc = ego_key.permute(0, 2, 3, 1).flatten(-2, -1).detach() 
             exo_desc = exo_key.permute(0, 2, 3, 1).flatten(-2, -1).detach()
 
-        ego_proj = ego_desc[:, 1:] + self.aff_proj(ego_desc[:, 1:])
-        exo_proj = exo_desc[:, 1:] + self.aff_proj(exo_desc[:, 1:])
-        ego_desc = self._reshape_transform(ego_desc[:, 1:, :], self.patch, self.stride)
+        ego_proj = ego_desc[:, 1:] + self.aff_proj(ego_desc[:, 1:]) #对应原文最后一层输出到Extract模块的跳跃连接
+        exo_proj = exo_desc[:, 1:] + self.aff_proj(exo_desc[:, 1:]) #选取第一个token（CLS token）之外的所有特征，因为只需要空间特征，然后使用MLP（原文中的φ）进行特征变换，然后残差连接，保留原始信息。
+        ego_desc = self._reshape_transform(ego_desc[:, 1:, :], self.patch, self.stride) 
         exo_desc = self._reshape_transform(exo_desc[:, 1:, :], self.patch, self.stride)
         ego_proj = self._reshape_transform(ego_proj, self.patch, self.stride)
         exo_proj = self._reshape_transform(exo_proj, self.patch, self.stride)
@@ -213,6 +237,9 @@ class Net(nn.Module):
 
         return gt_ego_cam
 
+    #先计算特征图的高度和宽度
+    #然后将扁平张量变成2维张量
+    #调整张量维度的顺序，送入卷积网络做进一步处理
     def _reshape_transform(self, tensor, patch_size, stride):
         height = (224 - patch_size) // stride + 1
         width = (224 - patch_size) // stride + 1
