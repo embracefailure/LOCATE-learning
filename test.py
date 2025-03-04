@@ -13,12 +13,15 @@ from utils.evaluation import cal_kl, cal_sim, cal_nss
 
 parser = argparse.ArgumentParser()
 ##  path
-parser.add_argument('--data_root', type=str, default='/home/gen/Project/aff_grounding/dataset/AGD20K/')
+parser.add_argument('--data_root', type=str, default='/home/gen/Project/aff_grounding/dataset/AGD20K/')# path to the dataset
 parser.add_argument('--model_file', type=str, default=None)
-parser.add_argument('--save_path', type=str, default='./save_preds')
-parser.add_argument("--divide", type=str, default="Seen")
+parser.add_argument('--save_path', type=str, default='./save_preds')# path to save the predictions
+parser.add_argument("--divide", type=str, default="Seen")# Seen or Unseen
 ##  image
-parser.add_argument('--crop_size', type=int, default=224)
+
+##resize_size (256):是将输入图像首先调整到的尺寸，通常比crop_size大一些，为了后续的裁剪操作提供足够的空间
+##crop_size (224):是最终输入到模型的尺寸，通常比resize_size小一些，为了减少计算量
+parser.add_argument('--crop_size', type=int, default=224) 
 parser.add_argument('--resize_size', type=int, default=256)
 #### test
 parser.add_argument('--num_workers', type=int, default=8)
@@ -45,8 +48,8 @@ if args.divide == "Seen":
 else:
     args.num_classes = 25
 
-args.test_root = os.path.join(args.data_root, args.divide, "testset", "egocentric")
-args.mask_root = os.path.join(args.data_root, args.divide, "testset", "GT")
+args.test_root = os.path.join(args.data_root, args.divide, "testset", "egocentric") # path to the test images
+args.mask_root = os.path.join(args.data_root, args.divide, "testset", "GT") # path to the ground truth masks
 
 if args.viz:
     if not os.path.exists(args.save_path):
@@ -56,7 +59,7 @@ if __name__ == '__main__':
     set_seed(seed=0)
 
     from data.datatest import TestData
-
+    # create the test dataset
     testset = TestData(image_root=args.test_root,
                        crop_size=args.crop_size,
                        divide=args.divide, mask_root=args.mask_root)
@@ -66,44 +69,44 @@ if __name__ == '__main__':
                                              num_workers=args.test_num_workers,
                                              pin_memory=True)
 
-    model = model(aff_classes=args.num_classes).cuda()
+    model = model(aff_classes=args.num_classes).cuda() # create the model
 
-    KLs = []
+    KLs = []# list to store the KLD values
     SIM = []
     NSS = []
     model.eval()
     assert os.path.exists(args.model_file), "Please provide the correct model file for testing"
     model.load_state_dict(torch.load(args.model_file))
 
-    GT_path = args.divide + "_gt.t7"
-    if not os.path.exists(GT_path):
-        process_gt(args)
+    GT_path = args.divide + "_gt.t7" # .t7 is torch file
+    if not os.path.exists(GT_path): # if the file does not exist, create it
+        process_gt(args) 
     GT_masks = torch.load(args.divide + "_gt.t7")
-
+    # GT_masks is a dictionary with key as the image name and value as the mask
     for step, (image, label, mask_path) in enumerate(tqdm(TestLoader)):
-        ego_pred = model.test_forward(image.cuda(), label.long().cuda())
-        cluster_sim_maps = []
-        ego_pred = np.array(ego_pred.squeeze().data.cpu())
-        ego_pred = normalize_map(ego_pred, args.crop_size)
+        ego_pred = model.test_forward(image.cuda(), label.long().cuda())# forward pass
+        cluster_sim_maps = []# list to store the similarity maps
+        ego_pred = np.array(ego_pred.squeeze().data.cpu())# convert to numpy array
+        ego_pred = normalize_map(ego_pred, args.crop_size)# normalize the map
 
-        names = mask_path[0].split("/")
-        key = names[-3] + "_" + names[-2] + "_" + names[-1]
-        GT_mask = GT_masks[key]
-        GT_mask = GT_mask / 255.0
+        names = mask_path[0].split("/")# get the image name
+        key = names[-3] + "_" + names[-2] + "_" + names[-1]# create the key
+        GT_mask = GT_masks[key]# get the mask from the dictionary
+        GT_mask = GT_mask / 255.0# normalize the mask
 
-        GT_mask = cv2.resize(GT_mask, (args.crop_size, args.crop_size))
+        GT_mask = cv2.resize(GT_mask, (args.crop_size, args.crop_size))# resize the mask
 
-        kld, sim, nss = cal_kl(ego_pred, GT_mask), cal_sim(ego_pred, GT_mask), cal_nss(ego_pred, GT_mask)
-        KLs.append(kld)
+        kld, sim, nss = cal_kl(ego_pred, GT_mask), cal_sim(ego_pred, GT_mask), cal_nss(ego_pred, GT_mask)# calculate the metrics
+        KLs.append(kld)# append the values to the list
         SIM.append(sim)
         NSS.append(nss)
 
-        if args.viz:
+        if args.viz:# if visualization is true
             img_name = key.split(".")[0]
-            viz_pred_test(args, image, ego_pred, GT_mask, aff_list, label, img_name)
+            viz_pred_test(args, image, ego_pred, GT_mask, aff_list, label, img_name)# visualize the predictions
 
-    mKLD = sum(KLs) / len(KLs)
+    mKLD = sum(KLs) / len(KLs) # calculate the mean of the KLD values
     mSIM = sum(SIM) / len(SIM)
     mNSS = sum(NSS) / len(NSS)
 
-    print(f"KLD = {round(mKLD, 3)}\nSIM = {round(mSIM, 3)}\nNSS = {round(mNSS, 3)}")
+    print(f"KLD = {round(mKLD, 3)}\nSIM = {round(mSIM, 3)}\nNSS = {round(mNSS, 3)}") # print the mean values 
