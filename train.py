@@ -60,25 +60,31 @@ if args.divide == "Seen":
 else:
     args.num_classes = 25
 
-args.exocentric_root = os.path.join(args.data_root, args.divide, "trainset", "exocentric")
+args.exocentric_root = os.path.join(args.data_root, args.divide, "trainset", "exocentric") # path to the exocentric images
 args.egocentric_root = os.path.join(args.data_root, args.divide, "trainset", "egocentric")
 args.test_root = os.path.join(args.data_root, args.divide, "testset", "egocentric")
 args.mask_root = os.path.join(args.data_root, args.divide, "testset", "GT")
-time_str = time.strftime('%Y%m%d_%H%M%S', time.localtime(time.time()))
+time_str = time.strftime('%Y%m%d_%H%M%S', time.localtime(time.time())) 
+#确保每次训练运行时创建唯一的目录名，方便追踪不同时间的训练结果，避免多次训练时文件相互覆盖
 args.save_path = os.path.join(args.save_root, time_str)
 
 if not os.path.exists(args.save_path):
     os.makedirs(args.save_path, exist_ok=True)
 dict_args = vars(args)
 
-shutil.copy('./models/locate.py', args.save_path)
+#代码备份：保存训练时使用的确切代码版本
+#实验复现：确保以后可以准确重现实验结果
+#版本追踪：记录每次实验使用的具体代码版本
+
+shutil.copy('./models/locate.py', args.save_path) # copy the model file to the save path
 shutil.copy('./train.py', args.save_path)
 
 str_1 = ""
 for key, value in dict_args.items():
     str_1 += key + "=" + str(value) + "\n"
 
-logging.basicConfig(filename='%s/run.log' % args.save_path, level=logging.INFO, format='%(message)s')
+
+logging.basicConfig(filename='%s/run.log' % args.save_path, level=logging.INFO, format='%(message)s') #
 logger = logging.getLogger()
 logger.addHandler(logging.StreamHandler(sys.stdout))
 logger.info(str_1)
@@ -113,14 +119,17 @@ if __name__ == '__main__':
     model = model(aff_classes=args.num_classes)
     model = model.cuda()
     model.train()
-    optimizer, scheduler = get_optimizer(model, args)
+    optimizer, scheduler = get_optimizer(model, args)# get the optimizer and scheduler
 
-    best_kld = 1000
+    best_kld = 1000 
+    #模型选择：用于选择训练过程中性能最好的模型
+    #保存策略：只有当前模型的KLD值比历史最佳值更小时才保存
+    #避免冗余：防止保存性能较差的模型，节省存储空间
     print('Train begining!')
     for epoch in range(args.epochs):
         model.train()
         logger.info('LR = ' + str(scheduler.get_last_lr()))
-        exo_aff_acc = AverageMeter()
+        exo_aff_acc = AverageMeter() 
         ego_obj_acc = AverageMeter()
 
         for step, (exocentric_image, egocentric_image, aff_label) in enumerate(TrainLoader):
@@ -130,28 +139,30 @@ if __name__ == '__main__':
 
             masks, logits, loss_proto, loss_con = model(exo, ego, aff_label, (epoch, args.warm_epoch))
 
-            exo_aff_logits = logits['aff']
-            num_exo = exo.shape[1]
-            exo_aff_loss = torch.zeros(1).cuda()
+            exo_aff_logits = logits['aff'] # b x n x 36
+            num_exo = exo.shape[1] # number of exocentric images in each sample 
+            exo_aff_loss = torch.zeros(1).cuda() # loss for exocentric images
             for n in range(num_exo):
                 exo_aff_loss += nn.CrossEntropyLoss().cuda()(exo_aff_logits[:, n], aff_label)
             exo_aff_loss /= num_exo
 
+            #总loss=第一视角交叉熵损失+第三视角交叉熵损失+原型损失+中心损失
             loss_dict = {'ego_ce': nn.CrossEntropyLoss().cuda()(logits['aff_ego'], aff_label),
                          'exo_ce': exo_aff_loss,
                          'con_loss': loss_proto,
                          'loss_cen': loss_con * 0.07,
                          }
+            
 
             loss = sum(loss_dict.values())
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            cur_batch = exo.size(0)
-            exo_acc = 100. * compute_cls_acc(logits['aff'].mean(1), aff_label)
-            exo_aff_acc.updata(exo_acc, cur_batch)
-            metric_dict = {'exo_aff_acc': exo_aff_acc.avg}
+            cur_batch = exo.size(0) # batch size
+            exo_acc = 100. * compute_cls_acc(logits['aff'].mean(1), aff_label) # calculate the accuracy
+            exo_aff_acc.updata(exo_acc, cur_batch) # update the accuracy
+            metric_dict = {'exo_aff_acc': exo_aff_acc.avg} # dictionary to store the accuracy
 
             if (step + 1) % args.show_step == 0:
                 log_str = 'epoch: %d/%d + %d/%d | ' % (epoch + 1, args.epochs, step + 1, len(TrainLoader))
