@@ -81,22 +81,22 @@ class Net(nn.Module):
 
         # --- Extract deep descriptors from DINO-vit --- #
         # 以ego_desc为例：
-        # ego_key维度: [batch_size, channels, patches+1, patches+1]
-        # 例如: [B, 384, 197, 197]，其中197 = 14*14 + 1(CLS token)
+        # ego_key维度: [batch_size, num_heads, N, C//num_heads]
+        # 例如: [B, 6, 197, 64]，其中197 = 14*14 + 1(CLS token) 64=384/6 
         
-        # 1. permute(0, 2, 3, 1): [B, 384, 197, 197] -> [B, 197, 197, 384]
-        # 2. flatten(-2, -1): [B, 197, 197, 384] -> [B, 197, 197*384]
+        # 1. permute(0, 2, 3, 1): [B, 6, 197, 64] -> [B, 197, 64, 6]
+        # 2. flatten(-2, -1): [B, 197, 64, 6] -> [B, 197, 384(64*6)]
         # 3. detach(): 分离计算图
         
-        # 1. ego_desc[:, 1:]: 移除CLS token，[B, 197, 197*384] -> [B, 196, 197*384]
+        # 1. ego_desc[:, 1:]: 移除CLS token，[B, 197, 384] -> [B, 196, 384]
         # 2. self.aff_proj(): MLP投影
         # 3. 残差连接: 原始特征 + 投影特征
         
-        #1. ego_desc[:, 1:, :]: 移除CLS token，[B, 197, 197*384] -> [B, 196, 197*384]
+        #1. ego_desc[:, 1:, :]: 移除CLS token，[B, 197, 384] -> [B, 196, 384]
         # 2. _reshape_transform内部转换:
         #    - 计算height和width: (224-16)/16 + 1 = 14
-        #    - reshape: [B, 196, C] -> [B, 14, 14, C]
-        #    - transpose: [B, 14, 14, C] -> [B, C, 14, 14]
+        #    - reshape: [B, 196, 384] -> [B, 14, 14, 384]
+        #    - transpose: [B, 14, 14, 384] -> [B, 384, 14, 14]
         
         with torch.no_grad():
             _, ego_key, ego_attn = self.vit_model.get_last_key(ego)  # attn: b x 6 x (1+hw) x (1+hw)
@@ -114,7 +114,7 @@ class Net(nn.Module):
         ego_proj = self._reshape_transform(ego_proj, self.patch, self.stride)
         exo_proj = self._reshape_transform(exo_proj, self.patch, self.stride)
 
-        b, c, h, w = ego_desc.shape
+        b, c, h, w = ego_desc.shape #[B, 384, 14, 14]
         ego_cls_attn = ego_attn[:, :, 0, 1:].reshape(b, 6, h, w)
         ego_cls_attn = (ego_cls_attn > ego_cls_attn.flatten(-2, -1).mean(-1, keepdim=True).unsqueeze(-1)).float()
         head_idxs = [0, 1, 3]
