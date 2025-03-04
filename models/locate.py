@@ -145,23 +145,35 @@ class Net(nn.Module):
             gt_aff_cam[b_, :] = aff_cam_re[b_, :, aff_label[b_]] 
 
         # --- Clustering extracted descriptors based on CAM --- #
+        #展平特征用于后续处理
         ego_desc_flat = ego_desc.flatten(-2, -1)  # b x 384 x hw
         exo_desc_re_flat = exo_desc.reshape(b, num_exo, c, h, w).flatten(-2, -1)
+        
+        #初始化存储张量
         sim_maps = torch.zeros(b, self.cluster_num, h * w).cuda()
         exo_sim_maps = torch.zeros(b, num_exo, self.cluster_num, h * w).cuda()
         part_score = torch.zeros(b, self.cluster_num).cuda()
         part_proto = torch.zeros(b, c).cuda()
+        
+        #特征提取和预处理
         for b_ in range(b):
+            #收集高激活区域的特征
             exo_aff_desc = []
             for n in range(num_exo):
+                #归一化CAM
                 tmp_cam = gt_aff_cam[b_, n].reshape(-1)
                 tmp_max, tmp_min = tmp_cam.max(), tmp_cam.min()
                 tmp_cam = (tmp_cam - tmp_min) / (tmp_max - tmp_min + 1e-10)
+                
+                #提取高激活区域的特征
                 tmp_desc = exo_desc_re_flat[b_, n]
                 tmp_top_desc = tmp_desc[:, torch.where(tmp_cam > self.aff_cam_thd)[0]].T  # n x c
                 exo_aff_desc.append(tmp_top_desc)
+                
+            #合并所有视角的特征
             exo_aff_desc = torch.cat(exo_aff_desc, dim=0)  # (n1 + n2 + n3) x c
 
+            #跳过特征不足的样本
             if exo_aff_desc.shape[0] < self.cluster_num:
                 continue
 
@@ -177,53 +189,73 @@ class Net(nn.Module):
             sim_map = torch.mm(clu_cens, F.normalize(ego_desc_flat[b_], dim=0))  # self.cluster_num x hw
             tmp_sim_max, tmp_sim_min = torch.max(sim_map, dim=-1, keepdim=True)[0], \
                                        torch.min(sim_map, dim=-1, keepdim=True)[0]
+            #生成第一视角相似度图
             sim_map_norm = (sim_map - tmp_sim_min) / (tmp_sim_max - tmp_sim_min + 1e-12)
-
+            
+            #生成硬性注意力图
             sim_map_hard = (sim_map_norm > torch.mean(sim_map_norm, 1, keepdim=True)).float()
             sam_hard = (ego_sam_flat > torch.mean(ego_sam_flat, 1, keepdim=True)).float()
-
-            inter = (sim_map_hard * sam_hard[b_]).sum(1)
-            union = sim_map_hard.sum(1) + sam_hard[b_].sum() - inter
-            p_score = (inter / sim_map_hard.sum(1) + sam_hard[b_].sum() / union) / 2
-
+            #计算IOU
+            inter = (sim_map_hard * sam_hard[b_]).sum(1) #similarity map与saliency map的交集
+            union = sim_map_hard.sum(1) + sam_hard[b_].sum() - inter #并集，总和减去交集
+            p_score = (inter / sim_map_hard.sum(1) + sam_hard[b_].sum() / union) / 2 #PartIoU得分
+            #保存结果
             sim_maps[b_] = sim_map
             part_score[b_] = p_score
-
+            #选择最佳原型
             if p_score.max() < self.part_iou_thd:
                 continue
 
             part_proto[b_] = clu_cens[torch.argmax(p_score)]
 
+        #重塑输出张量
         sim_maps = sim_maps.reshape(b, self.cluster_num, h, w)
         exo_sim_maps = exo_sim_maps.reshape(b, num_exo, self.cluster_num, h, w)
+        
+        #生成最终预测
         ego_proj = self.aff_ego_proj(ego_proj)
         ego_pred = self.aff_fc(ego_proj)
         aff_logits_ego = self.gap(ego_pred).view(b, self.aff_classes)
 
         # --- concentration loss --- #
+        #
         gt_ego_cam = torch.zeros(b, h, w).cuda()
         loss_con = torch.zeros(1).cuda()
         for b_ in range(b):
+            #1.提取当前样本对应标签的CAM
             gt_ego_cam[b_] = ego_pred[b_, aff_label[b_]]
-            loss_con += concentration_loss(ego_pred[b_])
-
+            #[b_, aff_label[b_]]选择第b_个样本中对应真实标签的激活图
+            
+            #2.计算concentration loss
+            loss_con += concentration_loss(ego_pred[b_])#在model_util.py里面可见详细计算过程
+            # concentration_loss用于促进CAM的紧凑性和集中性
+        #归一化CAM
         gt_ego_cam = normalize_minmax(gt_ego_cam)
+        #计算平均损失
         loss_con /= b
 
         # --- prototype guidance loss --- #
-        loss_proto = torch.zeros(1).cuda()
-        valid_batch = 0
-        if epoch[0] > epoch[1]:
+        loss_proto = torch.zeros(1).cuda()#初始化损失值
+        valid_batch = 0 #有效样本计数
+        if epoch[0] > epoch[1]: #只在特定训练阶段计算此损失 epoch[0]为当前epoch，epoch[1]为warm_epoch
             for b_ in range(b):
+                #检查是否有有效的原型
                 if not part_proto[b_].equal(torch.zeros(c).cuda()):
+                    #获取CAM Mask
                     mask = gt_ego_cam[b_]
+                    
+                    #应用mask到特征图
                     tmp_feat = ego_desc[b_] * mask
+                    
+                    #计算加权平均embedding
                     embedding = tmp_feat.reshape(tmp_feat.shape[0], -1).sum(1) / mask.sum()
+                    #计算与原型的余弦相似度损失
                     loss_proto += torch.max(
+                        #目标：使得embedding和part proto的余弦相似度尽可能接近
                         1 - F.cosine_similarity(embedding, part_proto[b_], dim=0) - self.cel_margin,
                         torch.zeros(1).cuda())
                     valid_batch += 1
-            loss_proto = loss_proto / (valid_batch + 1e-15)
+            loss_proto = loss_proto / (valid_batch + 1e-15) #计算平均损失
 
         masks = {'exo_aff': gt_aff_cam, 'ego_sam': ego_sam,
                  'pred': (sim_maps, exo_sim_maps, part_score, gt_ego_cam)}
